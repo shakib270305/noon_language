@@ -1,7 +1,11 @@
 import os
-import re
 import requests
 from flask import Flask, request, jsonify
+from langdetect import detect, DetectorFactory, LangDetectException
+
+# Make detection results consistent across runs (langdetect is otherwise
+# non-deterministic for ambiguous/short text).
+DetectorFactory.seed = 0
 
 app = Flask(__name__)
 
@@ -11,69 +15,86 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # ---------------------------------------------------------------------------
-# Language detection by Unicode script — no external API call, so this is
-# instant and can never 404/503/rate-limit. Covers the languages your group
-# actually needs (based on the rules message: Arabic, Bangla, Urdu, Hindi,
-# English). Any other script falls back to a generic English-only warning.
+# Language detection via langdetect — fully offline (no external API call),
+# so it can never 404/503/rate-limit like Gemini did. It covers 55 languages,
+# which is effectively every major world language. Text is compared purely
+# by statistical n-gram profiles, so it works for any script.
 # ---------------------------------------------------------------------------
 
-SCRIPT_RANGES = {
-    "bn": re.compile(r"[\u0980-\u09FF]"),          # Bengali
-    "ar_ur": re.compile(r"[\u0600-\u06FF]"),        # Arabic + Urdu (shared script)
-    "hi": re.compile(r"[\u0900-\u097F]"),          # Devanagari (Hindi)
-    "latin": re.compile(r"[A-Za-z]"),
-}
-
-# Characters that only appear in Urdu, not in standard Arabic.
-# If any of these show up in an Arabic-script message, treat it as Urdu.
-URDU_ONLY_CHARS = re.compile(
-    r"[\u0679\u0688\u0691\u06A9\u06AF\u06BA\u06BE\u06C1\u06C3\u06D2]"
-)
-
+# "Please send messages in English." pre-translated for every language code
+# that langdetect can return. Keys match langdetect's ISO codes exactly.
 WARNINGS = {
-    "bn": "দয়া করে ইংরেজিতে মেসেজ পাঠান।",
+    "af": "Stuur asseblief boodskappe in Engels.",
     "ar": "يرجى إرسال الرسائل باللغة الإنجليزية.",
-    "ur": "براہ کرم پیغامات انگریزی میں بھیجیں۔",
+    "bg": "Моля, изпращайте съобщения на английски.",
+    "bn": "দয়া করে ইংরেজিতে মেসেজ পাঠান।",
+    "ca": "Si us plau, envieu els missatges en anglès.",
+    "cs": "Posílejte prosím zprávy v angličtině.",
+    "cy": "Anfonwch negeseuon yn Saesneg os gwelwch yn dda.",
+    "da": "Send venligst beskeder på engelsk.",
+    "de": "Bitte senden Sie Nachrichten auf Englisch.",
+    "el": "Παρακαλώ στείλτε μηνύματα στα αγγλικά.",
+    "es": "Por favor, envía los mensajes en inglés.",
+    "et": "Palun saatke sõnumeid inglise keeles.",
+    "fa": "لطفاً پیام‌ها را به انگلیسی ارسال کنید.",
+    "fi": "Lähetä viestit englanniksi.",
+    "fr": "Veuillez envoyer les messages en anglais.",
+    "gu": "કૃપા કરીને સંદેશા અંગ્રેજીમાં મોકલો.",
+    "he": "אנא שלח הודעות באנגלית.",
     "hi": "कृपया संदेश अंग्रेज़ी में भेजें।",
-    # fallback for any other non-English script we don't have a translation for
-    "default": "Please send messages in English.",
+    "hr": "Molimo šaljite poruke na engleskom.",
+    "hu": "Kérjük, angol nyelven küldje az üzeneteket.",
+    "id": "Silakan kirim pesan dalam bahasa Inggris.",
+    "it": "Si prega di inviare i messaggi in inglese.",
+    "ja": "英語でメッセージを送ってください。",
+    "kn": "ದಯವಿಟ್ಟು ಸಂದೇಶಗಳನ್ನು ಇಂಗ್ಲಿಷ್‌ನಲ್ಲಿ ಕಳುಹಿಸಿ.",
+    "ko": "영어로 메시지를 보내주세요.",
+    "lt": "Prašome siųsti žinutes anglų kalba.",
+    "lv": "Lūdzu, sūtiet ziņas angļu valodā.",
+    "mk": "Ве молиме испраќајте пораки на англиски.",
+    "ml": "ദയവായി സന്ദേശങ്ങൾ ഇംഗ്ലീഷിൽ അയയ്ക്കുക.",
+    "mr": "कृपया संदेश इंग्रजीत पाठवा.",
+    "ne": "कृपया सन्देशहरू अङ्ग्रेजीमा पठाउनुहोस्।",
+    "nl": "Stuur berichten alstublieft in het Engels.",
+    "no": "Vennligst send meldinger på engelsk.",
+    "pa": "ਕਿਰਪਾ ਕਰਕੇ ਸੁਨੇਹੇ ਅੰਗਰੇਜ਼ੀ ਵਿੱਚ ਭੇਜੋ।",
+    "pl": "Proszę wysyłać wiadomości w języku angielskim.",
+    "pt": "Por favor, envie as mensagens em inglês.",
+    "ro": "Vă rugăm să trimiteți mesaje în engleză.",
+    "ru": "Пожалуйста, отправляйте сообщения на английском.",
+    "sk": "Posielajte správy v angličtine, prosím.",
+    "sl": "Prosimo, sporočila pošiljajte v angleščini.",
+    "so": "Fadlan farriimaha ku soo dir Ingiriisi.",
+    "sq": "Ju lutemi dërgoni mesazhe në anglisht.",
+    "sv": "Vänligen skicka meddelanden på engelska.",
+    "sw": "Tafadhali tuma ujumbe kwa Kiingereza.",
+    "ta": "தயவுசெய்து செய்திகளை ஆங்கிலத்தில் அனுப்பவும்.",
+    "te": "దయచేసి సందేశాలను ఆంగ్లంలో పంపండి.",
+    "th": "กรุณาส่งข้อความเป็นภาษาอังกฤษ",
+    "tl": "Mangyaring magpadala ng mensahe sa Ingles.",
+    "tr": "Lütfen mesajları İngilizce gönderin.",
+    "uk": "Будь ласка, надсилайте повідомлення англійською.",
+    "ur": "براہ کرم پیغامات انگریزی میں بھیجیں۔",
+    "vi": "Vui lòng gửi tin nhắn bằng tiếng Anh.",
+    "zh-cn": "请用英语发送消息。",
+    "zh-tw": "請用英文發送訊息。",
 }
 
 
 def detect_language(text):
     """
-    Returns a language code: 'en', 'bn', 'ar', 'ur', 'hi', or 'other'.
-    Decision is based on which script has the most characters in the text.
+    Returns a langdetect ISO code (e.g. 'en', 'bn', 'fr', 'zh-cn'),
+    or 'en' if detection fails/is ambiguous (fail-safe: never warn
+    on something we're not sure about).
     """
-
-    counts = {
-        "bn": len(SCRIPT_RANGES["bn"].findall(text)),
-        "ar_ur": len(SCRIPT_RANGES["ar_ur"].findall(text)),
-        "hi": len(SCRIPT_RANGES["hi"].findall(text)),
-        "latin": len(SCRIPT_RANGES["latin"].findall(text)),
-    }
-
-    # Nothing but latin letters (or no letters at all, e.g. only emoji/numbers)
-    # -> treat as English, matches "don't warn on emojis/numbers" requirement.
-    if counts["bn"] == 0 and counts["ar_ur"] == 0 and counts["hi"] == 0:
+    try:
+        return detect(text)
+    except LangDetectException:
         return "en"
-
-    top_script = max(counts, key=counts.get)
-
-    if top_script == "bn":
-        return "bn"
-
-    if top_script == "hi":
-        return "hi"
-
-    if top_script == "ar_ur":
-        return "ur" if URDU_ONLY_CHARS.search(text) else "ar"
-
-    return "en"
 
 
 def get_warning(lang_code):
-    return WARNINGS.get(lang_code, WARNINGS["default"])
+    return WARNINGS.get(lang_code)  # None if lang_code == "en" or unmapped
 
 
 def tg(method, payload=None):
@@ -173,18 +194,19 @@ def webhook():
         if is_admin(chat_id, user_id):
             return jsonify({"ok": True})
 
-        # Ignore very short messages
+        # Ignore very short messages (langdetect is unreliable below ~3 letters)
         if len("".join(ch for ch in text if ch.isalpha())) < 3:
             return jsonify({"ok": True})
 
         lang_code = detect_language(text)
+        warning = get_warning(lang_code)
 
-        if lang_code != "en":
+        if lang_code != "en" and warning:
 
             send_reply(
                 chat_id,
                 message["message_id"],
-                get_warning(lang_code)
+                warning
             )
 
     except Exception as e:
