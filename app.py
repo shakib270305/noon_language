@@ -1,24 +1,79 @@
 import os
-import json
+import re
 import requests
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# FIX: "gemini-2.5-flash" is being rejected (404) for this API key/project
-# even though it still shows up in ListModels. Using the "latest" alias
-# avoids this — Google points it at whichever Flash model is currently
-# being served, so it won't break again on the next model rotation.
-GEMINI_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/"
-    "models/gemini-flash-latest:generateContent"
+# ---------------------------------------------------------------------------
+# Language detection by Unicode script — no external API call, so this is
+# instant and can never 404/503/rate-limit. Covers the languages your group
+# actually needs (based on the rules message: Arabic, Bangla, Urdu, Hindi,
+# English). Any other script falls back to a generic English-only warning.
+# ---------------------------------------------------------------------------
+
+SCRIPT_RANGES = {
+    "bn": re.compile(r"[\u0980-\u09FF]"),          # Bengali
+    "ar_ur": re.compile(r"[\u0600-\u06FF]"),        # Arabic + Urdu (shared script)
+    "hi": re.compile(r"[\u0900-\u097F]"),          # Devanagari (Hindi)
+    "latin": re.compile(r"[A-Za-z]"),
+}
+
+# Characters that only appear in Urdu, not in standard Arabic.
+# If any of these show up in an Arabic-script message, treat it as Urdu.
+URDU_ONLY_CHARS = re.compile(
+    r"[\u0679\u0688\u0691\u06A9\u06AF\u06BA\u06BE\u06C1\u06C3\u06D2]"
 )
+
+WARNINGS = {
+    "bn": "দয়া করে ইংরেজিতে মেসেজ পাঠান।",
+    "ar": "يرجى إرسال الرسائل باللغة الإنجليزية.",
+    "ur": "براہ کرم پیغامات انگریزی میں بھیجیں۔",
+    "hi": "कृपया संदेश अंग्रेज़ी में भेजें।",
+    # fallback for any other non-English script we don't have a translation for
+    "default": "Please send messages in English.",
+}
+
+
+def detect_language(text):
+    """
+    Returns a language code: 'en', 'bn', 'ar', 'ur', 'hi', or 'other'.
+    Decision is based on which script has the most characters in the text.
+    """
+
+    counts = {
+        "bn": len(SCRIPT_RANGES["bn"].findall(text)),
+        "ar_ur": len(SCRIPT_RANGES["ar_ur"].findall(text)),
+        "hi": len(SCRIPT_RANGES["hi"].findall(text)),
+        "latin": len(SCRIPT_RANGES["latin"].findall(text)),
+    }
+
+    # Nothing but latin letters (or no letters at all, e.g. only emoji/numbers)
+    # -> treat as English, matches "don't warn on emojis/numbers" requirement.
+    if counts["bn"] == 0 and counts["ar_ur"] == 0 and counts["hi"] == 0:
+        return "en"
+
+    top_script = max(counts, key=counts.get)
+
+    if top_script == "bn":
+        return "bn"
+
+    if top_script == "hi":
+        return "hi"
+
+    if top_script == "ar_ur":
+        return "ur" if URDU_ONLY_CHARS.search(text) else "ar"
+
+    return "en"
+
+
+def get_warning(lang_code):
+    return WARNINGS.get(lang_code, WARNINGS["default"])
 
 
 def tg(method, payload=None):
@@ -47,87 +102,6 @@ def is_admin(chat_id, user_id):
 
     except Exception:
         return False
-
-
-def analyze_language(text):
-
-    prompt = f"""
-You are a language detector for a Telegram group moderation bot.
-
-Task:
-
-1. Detect whether the message is primarily English.
-2. If it is NOT primarily English, identify the language in English.
-3. Create a very short warning IN THE SAME LANGUAGE as the user's message saying:
-   "Please send messages in English."
-4. If the message is primarily English, do not create a warning.
-
-Return ONLY valid JSON with exactly these keys:
-
-{{
-  "is_english": true or false,
-  "language": "English or language name",
-  "reply": "warning in the same language, or empty string"
-}}
-
-Important:
-
-- Do not reply to a message that is clearly English.
-- For mixed messages, decide based on the dominant natural-language content.
-- Do not treat emojis, URLs, usernames, numbers, or product codes as a non-English language.
-- Keep the warning concise and polite.
-
-Message:
-{text}
-""".strip()
-
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {
-                        "text": prompt
-                    }
-                ]
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0,
-            "responseMimeType": "application/json"
-        }
-    }
-
-    headers = {
-        "Content-Type": "application/json",
-        "x-goog-api-key": GEMINI_API_KEY
-    }
-
-    r = requests.post(
-        GEMINI_URL,
-        headers=headers,
-        json=payload,
-        timeout=30
-    )
-
-    # IMPROVED: if Gemini returns an error, log the actual response body
-    # (not just the status code) so future issues are easy to diagnose
-    # from Render logs without needing to guess.
-    if not r.ok:
-        print("Gemini API error:", r.status_code, r.text)
-
-    r.raise_for_status()
-
-    data = r.json()
-
-    candidate = data["candidates"][0]["content"]["parts"][0]["text"]
-
-    result = json.loads(candidate)
-
-    return {
-        "is_english": bool(result.get("is_english", True)),
-        "language": str(result.get("language", "")),
-        "reply": str(result.get("reply", "")).strip()
-    }
 
 
 def send_reply(chat_id, reply_to_message_id, text):
@@ -203,14 +177,14 @@ def webhook():
         if len("".join(ch for ch in text if ch.isalpha())) < 3:
             return jsonify({"ok": True})
 
-        result = analyze_language(text)
+        lang_code = detect_language(text)
 
-        if not result["is_english"] and result["reply"]:
+        if lang_code != "en":
 
             send_reply(
                 chat_id,
                 message["message_id"],
-                result["reply"]
+                get_warning(lang_code)
             )
 
     except Exception as e:
