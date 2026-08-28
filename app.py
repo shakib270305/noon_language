@@ -11,9 +11,13 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
+# FIX: "gemini-2.5-flash" is being rejected (404) for this API key/project
+# even though it still shows up in ListModels. Using the "latest" alias
+# avoids this — Google points it at whichever Flash model is currently
+# being served, so it won't break again on the next model rotation.
 GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/"
-    "models/gemini-2.5-flash:generateContent"
+    "models/gemini-flash-latest:generateContent"
 )
 
 
@@ -104,6 +108,12 @@ Message:
         json=payload,
         timeout=30
     )
+
+    # IMPROVED: if Gemini returns an error, log the actual response body
+    # (not just the status code) so future issues are easy to diagnose
+    # from Render logs without needing to guess.
+    if not r.ok:
+        print("Gemini API error:", r.status_code, r.text)
 
     r.raise_for_status()
 
