@@ -208,6 +208,7 @@ def tg(
 # ============================================================
 
 WARNINGS = {
+
     "ar": "يرجى إرسال الرسائل باللغة الإنجليزية.",
     "bg": "Моля, изпращайте съобщения на английски.",
     "bn": "দয়া করে ইংরেজিতে মেসেজ পাঠান।",
@@ -385,12 +386,32 @@ def create_customer_topic(user):
 
 
 # ============================================================
+# MEDIA / CONTENT HELPERS
+# ============================================================
+
+MEDIA_FIELDS = (
+    "photo", "video", "voice", "video_note",
+    "audio", "document", "sticker", "animation"
+)
+
+
+def message_has_content(message):
+    """True if the message has text OR any supported media type
+    (photo, video, voice, video note, audio, document, sticker, GIF)."""
+
+    if (message.get("text") or "").strip():
+        return True
+
+    return any(message.get(field) for field in MEDIA_FIELDS)
+
+
+# ============================================================
 # CUSTOMER → SUPPORT GROUP
 # ============================================================
 
 def send_customer_message_to_support(
     user,
-    text
+    message
 ):
 
     customer_id = int(
@@ -420,18 +441,35 @@ def send_customer_message_to_support(
 
         customer_name = first_name
 
-    support_message = (
+    # A short header identifying the sender is posted first (kept as
+    # plain text so the "User ID: <number>" fallback-recovery logic in
+    # extract_customer_id_from_message still works even if the database
+    # mapping is ever lost). The actual message — text, photo, sticker,
+    # video, voice, GIF, whatever it is — is then copied in as-is right
+    # after it using copyMessage, which handles every content type
+    # without needing separate code per media type.
+
+    header = (
         f"👤 Customer: {customer_name}\n"
-        f"🆔 User ID: {customer_id}\n\n"
-        f"{text}"
+        f"🆔 User ID: {customer_id}"
     )
 
-    result = tg(
+    tg(
         "sendMessage",
         {
             "chat_id": SUPPORT_GROUP_ID,
             "message_thread_id": topic_id,
-            "text": support_message
+            "text": header
+        }
+    )
+
+    result = tg(
+        "copyMessage",
+        {
+            "chat_id": SUPPORT_GROUP_ID,
+            "message_thread_id": topic_id,
+            "from_chat_id": message["chat"]["id"],
+            "message_id": message["message_id"]
         }
     )
 
@@ -441,13 +479,14 @@ def send_customer_message_to_support(
 
     print(
         f"Customer {customer_id} "
-        f"message sent to topic {topic_id}"
+        f"message copied to topic {topic_id}"
     )
 
     print(
         f"Support message ID: "
         f"{support_message_id}"
     )
+
 
 
 # ============================================================
@@ -500,15 +539,11 @@ def send_admin_message_to_customer(
     message
 ):
 
-    text = (
-        message.get("text")
-        or ""
-    ).strip()
-
-    if not text:
+    if not message_has_content(message):
 
         print(
-            "Support message has no text"
+            "Support message has no "
+            "text or media"
         )
 
         return False
@@ -701,16 +736,19 @@ def send_admin_message_to_customer(
         return False
 
     # --------------------------------------------------------
-    # Send message to customer
+    # Send message to customer (copyMessage handles text, photos,
+    # videos, voice notes, GIFs, stickers, documents — anything —
+    # without needing separate code per media type)
     # --------------------------------------------------------
 
     try:
 
         tg(
-            "sendMessage",
+            "copyMessage",
             {
                 "chat_id": customer_id,
-                "text": text
+                "from_chat_id": SUPPORT_GROUP_ID,
+                "message_id": message["message_id"]
             }
         )
 
@@ -828,7 +866,7 @@ def webhook():
 
         if chat.get("type") == "private":
 
-            if not text:
+            if not message_has_content(message):
 
                 return jsonify({
                     "ok": True
@@ -836,7 +874,7 @@ def webhook():
 
             send_customer_message_to_support(
                 user,
-                text
+                message
             )
 
             return jsonify({
