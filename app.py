@@ -447,18 +447,23 @@ def webhook():
         # --------------------------------------------------------
         # SUPPORT FORUM GROUP:
         # A) Admin reply -> customer
-        # B) Non-admin group message in a customer topic -> language warning
+        # B) Non-admin group message -> language warning
         # --------------------------------------------------------
+        # /getid works in any group, including a private group.
+        if text == "/getid":
+            tg(
+                "sendMessage",
+                {
+                    "chat_id": chat_id,
+                    "text": f"📌 Group ID: {chat_id}"
+                }
+            )
+            return jsonify({"ok": True})
+
         if str(chat_id) == SUPPORT_GROUP_ID:
 
             # Admin's topic reply is sent to the mapped customer.
             if relay_admin_reply(message):
-                return jsonify({"ok": True})
-
-            # Only normal text messages need language detection.
-            text = (message.get("text") or "").strip()
-
-            if not text:
                 return jsonify({"ok": True})
 
             # Ignore commands such as /start, /help, etc.
