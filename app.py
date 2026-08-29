@@ -208,7 +208,6 @@ def tg(
 # ============================================================
 
 WARNINGS = {
-
     "ar": "يرجى إرسال الرسائل باللغة الإنجليزية.",
     "bg": "Моля, изпращайте съобщения на английски.",
     "bn": "দয়া করে ইংরেজিতে মেসেজ পাঠান।",
@@ -798,25 +797,20 @@ def webhook():
             or ""
         ).strip()
 
-        # TEMPORARY DEBUG LOG — remove once the chat_id mismatch is found.
-        # Prints unconditionally, for every single update, before any
-        # branching, so we can see exactly what Telegram sent us.
-        print(
-            "DEBUG update:",
-            "chat_id =", chat_id,
-            "| chat_type =", chat.get("type"),
-            "| chat_title =", chat.get("title"),
-            "| from_user_id =", user.get("id"),
-            "| from_username =", user.get("username"),
-            "| message_thread_id =", message.get("message_thread_id"),
-            "| text =", text,
-        )
-
         # ----------------------------------------------------
-        # Ignore bot messages
+        # Ignore real bots, but NOT Telegram's special
+        # "GroupAnonymousBot" account — that's what Telegram
+        # uses as the sender when an admin posts anonymously
+        # ("Remain Anonymous" enabled). Its user id is fixed
+        # across every group/channel: 1087968824. Without this
+        # exception, anonymous-admin replies get silently
+        # dropped before they ever reach the customer-routing
+        # logic below.
         # ----------------------------------------------------
 
-        if user.get("is_bot"):
+        ANONYMOUS_ADMIN_ID = 1087968824
+
+        if user.get("is_bot") and user.get("id") != ANONYMOUS_ADMIN_ID:
 
             return jsonify({
                 "ok": True
