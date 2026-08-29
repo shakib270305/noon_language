@@ -1,39 +1,129 @@
 import os
-import re
+import sqlite3
+import threading
 import requests
 from flask import Flask, request, jsonify
 from langdetect import detect, DetectorFactory, LangDetectException
 
-# Make detection results consistent across runs (langdetect is otherwise
-# non-deterministic for ambiguous/short text).
+# Make langdetect deterministic.
 DetectorFactory.seed = 0
 
 app = Flask(__name__)
 
+# ============================================================
+# ENVIRONMENT VARIABLES
+# ============================================================
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+SUPPORT_GROUP_ID = os.environ.get("SUPPORT_GROUP_ID", "").strip()
 
-# Your own Telegram numeric user ID(s), comma-separated (get each from
-# @userinfobot). Any private message someone sends directly to the bot
-# gets forwarded to every ID listed here, since Telegram has no built-in
-# inbox/dashboard for bot owners.
-ADMIN_CHAT_IDS = [
-    cid.strip()
-    for cid in os.environ.get("ADMIN_CHAT_IDS", "").split(",")
-    if cid.strip()
-]
+# Two (or more) admin Telegram numeric user IDs, comma-separated.
+ADMIN_CHAT_IDS = {
+    x.strip()
+    for x in os.environ.get("ADMIN_CHAT_IDS", "").split(",")
+    if x.strip()
+}
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# ---------------------------------------------------------------------------
-# Language detection via langdetect — fully offline (no external API call),
-# so it can never 404/503/rate-limit like Gemini did. It covers 55 languages,
-# which is effectively every major world language. Text is compared purely
-# by statistical n-gram profiles, so it works for any script.
-# ---------------------------------------------------------------------------
+# SQLite stores customer -> forum topic mapping.
+DB_PATH = os.environ.get("DB_PATH", "customer_topics.db")
+db_lock = threading.Lock()
 
-# "Please send messages in English." pre-translated for every language code
-# that langdetect can return. Keys match langdetect's ISO codes exactly.
+
+# ============================================================
+# DATABASE
+# ============================================================
+def db_connect():
+    conn = sqlite3.connect(DB_PATH, timeout=20)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS customer_topics (
+            user_id INTEGER PRIMARY KEY,
+            topic_id INTEGER NOT NULL UNIQUE,
+            first_name TEXT DEFAULT '',
+            username TEXT DEFAULT '',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+with db_connect() as conn:
+    pass
+
+
+def get_topic(user_id):
+    with db_lock:
+        conn = db_connect()
+        row = conn.execute(
+            "SELECT topic_id FROM customer_topics WHERE user_id = ?",
+            (user_id,)
+        ).fetchone()
+        conn.close()
+    return row[0] if row else None
+
+
+def get_user_by_topic(topic_id):
+    with db_lock:
+        conn = db_connect()
+        row = conn.execute(
+            "SELECT user_id FROM customer_topics WHERE topic_id = ?",
+            (topic_id,)
+        ).fetchone()
+        conn.close()
+    return row[0] if row else None
+
+
+def save_topic(user_id, topic_id, first_name="", username=""):
+    with db_lock:
+        conn = db_connect()
+        conn.execute(
+            """
+            INSERT INTO customer_topics
+                (user_id, topic_id, first_name, username)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                topic_id = excluded.topic_id,
+                first_name = excluded.first_name,
+                username = excluded.username
+            """,
+            (user_id, topic_id, first_name or "", username or "")
+        )
+        conn.commit()
+        conn.close()
+
+
+# ============================================================
+# TELEGRAM API
+# ============================================================
+def tg(method, payload=None):
+    response = requests.post(
+        f"{TELEGRAM_API}/{method}",
+        json=payload or {},
+        timeout=30
+    )
+
+    try:
+        data = response.json()
+    except Exception:
+        response.raise_for_status()
+        raise
+
+    if not data.get("ok"):
+        raise RuntimeError(
+            f"Telegram {method} failed: "
+            f"{data.get('description', data)}"
+        )
+
+    return data
+
+
+# ============================================================
+# LANGUAGE DETECTOR
+# ============================================================
+# Warning shown in the support group when a non-English message
+# is sent by a non-admin.
 WARNINGS = {
     "ar": "يرجى إرسال الرسائل باللغة الإنجليزية.",
     "bg": "Моля, изпращайте съобщения на английски.",
@@ -62,136 +152,249 @@ WARNINGS = {
 
 
 def detect_language(text):
-    """
-    Returns a langdetect ISO code (e.g. 'en', 'bn', 'fr', 'zh-cn'),
-    or 'en' if detection fails/is ambiguous (fail-safe: never warn
-    on something we're not sure about).
-    """
     try:
         return detect(text)
     except LangDetectException:
+        # Fail safe: don't warn when detection is uncertain.
         return "en"
 
 
-def get_warning(lang_code):
-    return WARNINGS.get(lang_code)  # None if lang_code == "en" or unmapped
+def send_group_language_warning(chat_id, message_id, text):
+    letters = "".join(ch for ch in text if ch.isalpha())
 
+    # langdetect is unreliable for extremely short messages.
+    if len(letters) < 3:
+        return
 
-def tg(method, payload=None):
-    r = requests.post(
-        f"{TELEGRAM_API}/{method}",
-        json=payload or {},
-        timeout=20
-    )
-    r.raise_for_status()
-    return r.json()
+    lang_code = detect_language(text)
+    warning = WARNINGS.get(lang_code)
 
-
-def is_admin(chat_id, user_id):
-    try:
-        data = tg(
-            "getChatMember",
+    if warning:
+        tg(
+            "sendMessage",
             {
                 "chat_id": chat_id,
-                "user_id": user_id
+                "text": warning,
+                "reply_to_message_id": message_id,
+                "allow_sending_without_reply": True
             }
         )
 
-        status = data.get("result", {}).get("status")
 
-        return status in {"creator", "administrator"}
+# ============================================================
+# CUSTOMER / TOPIC HELPERS
+# ============================================================
+def safe_name(user):
+    first = (user.get("first_name") or "").strip()
+    last = (user.get("last_name") or "").strip()
+    full = " ".join(x for x in (first, last) if x)
+    return full or "Unknown User"
 
-    except Exception:
-        return False
 
+def create_customer_topic(user):
+    if not SUPPORT_GROUP_ID:
+        raise RuntimeError("SUPPORT_GROUP_ID is not configured.")
 
-USER_ID_IN_NOTICE = re.compile(r"User ID:\s*(\d+)")
+    user_id = user["id"]
 
+    # Telegram forum topic names have a limited practical length.
+    title = f"{safe_name(user)[:35]} | {user_id}"
 
-def forward_to_admin(user, text):
-
-    if not ADMIN_CHAT_IDS:
-        return
-
-    name = (user.get("first_name") or "").strip()
-    username = user.get("username")
-    tag = f"@{username}" if username else "(no username)"
-    user_id = user.get("id")
-
-    notice = (
-        f"📩 New private message to the bot\n"
-        f"From: {name} {tag}\n"
-        f"User ID: {user_id}\n\n"
-        f"{text}"
+    result = tg(
+        "createForumTopic",
+        {
+            "chat_id": SUPPORT_GROUP_ID,
+            "name": title
+        }
     )
 
-    for chat_id in ADMIN_CHAT_IDS:
-        try:
-            tg("sendMessage", {"chat_id": chat_id, "text": notice})
-        except Exception as e:
-            print(f"Failed to forward to admin {chat_id}:", repr(e))
+    topic_id = result["result"]["message_thread_id"]
 
+    save_topic(
+        user_id=user_id,
+        topic_id=topic_id,
+        first_name=user.get("first_name", ""),
+        username=user.get("username", "")
+    )
 
-def try_relay_admin_reply(message):
-    """
-    If an admin replies (Telegram's Reply feature) to one of our forwarded
-    notices, pull the original sender's User ID out of that notice and
-    send the admin's text straight to them instead of re-forwarding it
-    to the other admins. Returns True if it handled (and sent) a relay.
-    """
+    username = (
+        f"@{user['username']}"
+        if user.get("username")
+        else "(no username)"
+    )
 
-    replied = message.get("reply_to_message")
-
-    if not replied:
-        return False
-
-    original_text = replied.get("text") or ""
-    match = USER_ID_IN_NOTICE.search(original_text)
-
-    if not match:
-        return False
-
-    target_user_id = match.group(1)
-    reply_text = (message.get("text") or "").strip()
-
-    if not reply_text:
-        return False
+    info = (
+        "👤 CUSTOMER CHAT\n\n"
+        f"Name: {safe_name(user)}\n"
+        f"Username: {username}\n"
+        f"User ID: {user_id}\n\n"
+        "💬 Reply to the customer's message in this topic "
+        "to send your reply to the customer."
+    )
 
     try:
-        tg("sendMessage", {"chat_id": target_user_id, "text": reply_text})
+        tg(
+            "sendMessage",
+            {
+                "chat_id": SUPPORT_GROUP_ID,
+                "message_thread_id": topic_id,
+                "text": info
+            }
+        )
     except Exception as e:
-        print(f"Failed to relay admin reply to {target_user_id}:", repr(e))
+        print("Could not send topic info:", repr(e))
 
-    return True
-
-
-def send_reply(chat_id, reply_to_message_id, text):
-
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "reply_to_message_id": reply_to_message_id,
-        "allow_sending_without_reply": True
-    }
-
-    tg("sendMessage", payload)
+    return topic_id
 
 
+def get_or_create_topic(user):
+    topic_id = get_topic(user["id"])
+
+    if topic_id is not None:
+        return topic_id
+
+    return create_customer_topic(user)
+
+
+# ============================================================
+# CUSTOMER -> TOPIC
+# ============================================================
+def forward_customer_message(message, user):
+    topic_id = get_or_create_topic(user)
+
+    text = (message.get("text") or "").strip()
+
+    username = (
+        f"@{user['username']}"
+        if user.get("username")
+        else "(no username)"
+    )
+
+    header = (
+        f"👤 {safe_name(user)} {username}\n"
+        f"🆔 {user['id']}\n\n"
+    )
+
+    if text:
+        tg(
+            "sendMessage",
+            {
+                "chat_id": SUPPORT_GROUP_ID,
+                "message_thread_id": topic_id,
+                "text": header + text
+            }
+        )
+        return
+
+    # Copy photos, videos, documents, voice notes, stickers, etc.
+    # when Telegram permits copying them.
+    try:
+        tg(
+            "copyMessage",
+            {
+                "chat_id": SUPPORT_GROUP_ID,
+                "from_chat_id": message["chat"]["id"],
+                "message_id": message["message_id"],
+                "message_thread_id": topic_id
+            }
+        )
+
+        tg(
+            "sendMessage",
+            {
+                "chat_id": SUPPORT_GROUP_ID,
+                "message_thread_id": topic_id,
+                "text": header + "📎 Customer sent a non-text message."
+            }
+        )
+
+    except Exception as e:
+        print("Customer non-text copy failed:", repr(e))
+
+        tg(
+            "sendMessage",
+            {
+                "chat_id": SUPPORT_GROUP_ID,
+                "message_thread_id": topic_id,
+                "text": header +
+                        "📎 Customer sent a message that could not be copied."
+            }
+        )
+
+
+# ============================================================
+# ADMIN -> CUSTOMER
+# ============================================================
+def relay_admin_reply(message):
+    chat_id = str(message.get("chat", {}).get("id", ""))
+    admin_id = str(message.get("from", {}).get("id", ""))
+
+    if chat_id != SUPPORT_GROUP_ID:
+        return False
+
+    if admin_id not in ADMIN_CHAT_IDS:
+        return False
+
+    topic_id = message.get("message_thread_id")
+
+    if not topic_id:
+        return False
+
+    target_user_id = get_user_by_topic(topic_id)
+
+    # This is not one of our customer topics.
+    if target_user_id is None:
+        return False
+
+    text = (message.get("text") or "").strip()
+
+    if text:
+        tg(
+            "sendMessage",
+            {
+                "chat_id": target_user_id,
+                "text": text
+            }
+        )
+        return True
+
+    # Relay admin media/files too.
+    try:
+        tg(
+            "copyMessage",
+            {
+                "chat_id": target_user_id,
+                "from_chat_id": message["chat"]["id"],
+                "message_id": message["message_id"]
+            }
+        )
+        return True
+
+    except Exception as e:
+        print("Admin non-text relay failed:", repr(e))
+        return False
+
+
+# ============================================================
+# WEBHOOK
+# ============================================================
 @app.get("/")
 def home():
-    return "Noon Assistant is running."
+    return "Noon Customer Support Bot is running."
 
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True})
+    return jsonify({
+        "ok": True,
+        "support_group_configured": bool(SUPPORT_GROUP_ID),
+        "admins_configured": len(ADMIN_CHAT_IDS)
+    })
 
 
 @app.post("/webhook")
 def webhook():
-
     if WEBHOOK_SECRET:
-
         supplied = request.headers.get(
             "X-Telegram-Bot-Api-Secret-Token",
             ""
@@ -203,18 +406,12 @@ def webhook():
     update = request.get_json(silent=True) or {}
 
     try:
-
         message = (
             update.get("message")
             or update.get("edited_message")
         )
 
         if not message:
-            return jsonify({"ok": True})
-
-        text = (message.get("text") or "").strip()
-
-        if not text:
             return jsonify({"ok": True})
 
         chat = message.get("chat", {})
@@ -226,61 +423,89 @@ def webhook():
         if not chat_id or not user_id:
             return jsonify({"ok": True})
 
-        # Ignore other bots (but not commands here — /start in a private
-        # chat still needs to reach the forwarding block below)
+        # Never process messages sent by bots.
         if user.get("is_bot"):
             return jsonify({"ok": True})
 
-        # Someone DM'd the bot directly (private chat, not the group).
+        # --------------------------------------------------------
+        # PRIVATE CHAT:
+        # Customer -> Bot -> Customer's Forum Topic
+        # --------------------------------------------------------
         if chat.get("type") == "private":
-
-            # If this is an admin replying to one of our forwarded
-            # notices, relay it straight to the original sender instead
-            # of re-forwarding it as a fresh notice.
-            if str(chat_id) in ADMIN_CHAT_IDS and try_relay_admin_reply(message):
+            if not SUPPORT_GROUP_ID:
+                print("ERROR: SUPPORT_GROUP_ID is not configured.")
                 return jsonify({"ok": True})
 
-            # Otherwise, forward it to the owner(s) so it's actually
-            # visible somewhere, since Telegram gives bot owners no
-            # inbox of their own.
-            forward_to_admin(user, text)
+            # Admins can use the bot privately without becoming
+            # customer records.
+            if str(user_id) in ADMIN_CHAT_IDS:
+                return jsonify({"ok": True})
+
+            forward_customer_message(message, user)
             return jsonify({"ok": True})
 
-        # Ignore commands (group only, from here on)
-        if text.startswith("/"):
-            return jsonify({"ok": True})
+        # --------------------------------------------------------
+        # SUPPORT FORUM GROUP:
+        # A) Admin reply -> customer
+        # B) Non-admin group message in a customer topic -> language warning
+        # --------------------------------------------------------
+        if str(chat_id) == SUPPORT_GROUP_ID:
 
-        # Ignore group admins
-        if is_admin(chat_id, user_id):
-            return jsonify({"ok": True})
+            # Admin's topic reply is sent to the mapped customer.
+            if relay_admin_reply(message):
+                return jsonify({"ok": True})
 
-        # Ignore very short messages (langdetect is unreliable below ~3 letters)
-        if len("".join(ch for ch in text if ch.isalpha())) < 3:
-            return jsonify({"ok": True})
+            # Only normal text messages need language detection.
+            text = (message.get("text") or "").strip()
 
-        lang_code = detect_language(text)
-        warning = get_warning(lang_code)
+            if not text:
+                return jsonify({"ok": True})
 
-        if lang_code != "en" and warning:
+            # Ignore commands such as /start, /help, etc.
+            if text.startswith("/"):
+                return jsonify({"ok": True})
 
-            send_reply(
+            # Ignore admins/owner for language warning.
+            if str(user_id) in ADMIN_CHAT_IDS:
+                return jsonify({"ok": True})
+
+            # Also check actual Telegram admin status, so other group
+            # administrators aren't warned.
+            try:
+                member = tg(
+                    "getChatMember",
+                    {
+                        "chat_id": chat_id,
+                        "user_id": user_id
+                    }
+                )
+                status = member.get("result", {}).get("status")
+
+                if status in {"creator", "administrator"}:
+                    return jsonify({"ok": True})
+
+            except Exception as e:
+                print("Admin status check failed:", repr(e))
+
+            # Preserve the old language-warning functionality.
+            send_group_language_warning(
                 chat_id,
                 message["message_id"],
-                warning
+                text
             )
 
-    except Exception as e:
+            return jsonify({"ok": True})
 
+        # Ignore messages from unrelated chats/groups.
+        return jsonify({"ok": True})
+
+    except Exception as e:
+        # Return 200 so Telegram does not endlessly retry an update.
         print("Processing error:", repr(e))
 
     return jsonify({"ok": True})
 
 
 if __name__ == "__main__":
-
     port = int(os.environ.get("PORT", "10000"))
-
-    app.run(
-        host="0.0.0.0",
-        port=port
-    )
+    app.run(host="0.0.0.0", port=port)
