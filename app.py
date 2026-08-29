@@ -1,10 +1,8 @@
 import os
-import json
 import requests
-
+import psycopg2
 from flask import Flask, request, jsonify
 from langdetect import detect, DetectorFactory, LangDetectException
-
 
 # ============================================================
 # BASIC SETTINGS
@@ -15,18 +13,15 @@ DetectorFactory.seed = 0
 app = Flask(__name__)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 
-# SECRET SUPPORT GROUP
-SUPPORT_GROUP_ID = int(
-    os.environ["SUPPORT_GROUP_ID"]
-)
+SUPPORT_GROUP_ID = int(os.environ["SUPPORT_GROUP_ID"])
 
-# FIRST GROUP
 LANGUAGE_GROUP_ID = os.environ.get(
     "LANGUAGE_GROUP_ID", ""
 ).strip()
+
+DATABASE_URL = os.environ["DATABASE_URL"]
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
@@ -35,84 +30,113 @@ TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 # DATABASE
 # ============================================================
 
-DATA_FILE = "customer_topics.json"
-
-customer_topics = {}
-support_messages = {}
+def db_connect():
+    return psycopg2.connect(DATABASE_URL)
 
 
-def load_database():
-
-    global customer_topics
-    global support_messages
+def init_database():
+    conn = db_connect()
 
     try:
+        cur = conn.cursor()
 
-        with open(
-            DATA_FILE,
-            "r",
-            encoding="utf-8"
-        ) as f:
-
-            data = json.load(f)
-
-            # New format
-            if isinstance(data, dict) and (
-                "customer_topics" in data
-                or "support_messages" in data
-            ):
-
-                customer_topics = data.get(
-                    "customer_topics",
-                    {}
-                )
-
-                support_messages = data.get(
-                    "support_messages",
-                    {}
-                )
-
-            # Old format
-            else:
-
-                customer_topics = data
-                support_messages = {}
-
-    except Exception:
-
-        customer_topics = {}
-        support_messages = {}
-
-
-load_database()
-
-
-def save_database():
-
-    try:
-
-        with open(
-            DATA_FILE,
-            "w",
-            encoding="utf-8"
-        ) as f:
-
-            json.dump(
-                {
-                    "customer_topics": customer_topics,
-                    "support_messages": support_messages
-                },
-                f,
-                ensure_ascii=False,
-                indent=2
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS customer_topics (
+                customer_id BIGINT PRIMARY KEY,
+                topic_id BIGINT UNIQUE NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
+        """)
 
-    except Exception as e:
+        conn.commit()
+        cur.close()
 
-        print(
-            "DATABASE SAVE ERROR:",
-            repr(e)
+    finally:
+        conn.close()
+
+
+def get_customer_topic(customer_id):
+    conn = db_connect()
+
+    try:
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT topic_id
+            FROM customer_topics
+            WHERE customer_id = %s
+            """,
+            (customer_id,)
         )
+
+        row = cur.fetchone()
+
+        cur.close()
+
+        if row:
+            return int(row[0])
+
+        return None
+
+    finally:
+        conn.close()
+
+
+def get_customer_by_topic(topic_id):
+    conn = db_connect()
+
+    try:
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT customer_id
+            FROM customer_topics
+            WHERE topic_id = %s
+            """,
+            (topic_id,)
+        )
+
+        row = cur.fetchone()
+
+        cur.close()
+
+        if row:
+            return int(row[0])
+
+        return None
+
+    finally:
+        conn.close()
+
+
+def save_customer_topic(customer_id, topic_id):
+    conn = db_connect()
+
+    try:
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            INSERT INTO customer_topics
+                (customer_id, topic_id)
+            VALUES
+                (%s, %s)
+            ON CONFLICT (customer_id)
+            DO UPDATE SET topic_id = EXCLUDED.topic_id
+            """,
+            (customer_id, topic_id)
+        )
+
+        conn.commit()
+        cur.close()
+
+    finally:
+        conn.close()
+
+
+init_database()
 
 
 # ============================================================
@@ -132,7 +156,6 @@ def tg(method, payload=None):
     data = response.json()
 
     if not data.get("ok"):
-
         raise Exception(
             f"Telegram API error in {method}: {data}"
         )
@@ -141,7 +164,7 @@ def tg(method, payload=None):
 
 
 # ============================================================
-# LANGUAGE WARNING
+# LANGUAGE WARNINGS
 # ============================================================
 
 WARNINGS = {
@@ -198,7 +221,7 @@ WARNINGS = {
         "దయచేసి సందేశాలను ఆంగ్లంలో పంపండి.",
 
     "ml":
-        "ദയവായി സന്ദേശങ്ങൾ ഇംഗ്ലീഷിൽ അയയ്ക്കുക.",
+        "ദയവായി സന്ദേശങ്ങളെ ഇംഗ്ലീഷിൽ അയയ്ക്കുക.",
 
     "kn":
         "ದಯವಿಟ್ಟು ಸಂದೇಶಗಳನ್ನು ಇಂಗ್ಲಿಷ್‌ನಲ್ಲಿ ಕಳುಹಿಸಿ.",
@@ -235,15 +258,12 @@ WARNINGS = {
 def detect_language(text):
 
     try:
-
         return detect(text)
 
     except LangDetectException:
-
         return "en"
 
     except Exception:
-
         return "en"
 
 
@@ -288,19 +308,21 @@ def send_language_warning(message):
 
 
 # ============================================================
-# CREATE CUSTOMER TOPIC
+# CREATE / GET CUSTOMER TOPIC
 # ============================================================
 
 def create_customer_topic(user):
 
-    user_id = str(user["id"])
+    customer_id = int(user["id"])
 
-    # Existing topic
-    if user_id in customer_topics:
+    # --------------------------------------------------------
+    # Check database first
+    # --------------------------------------------------------
 
-        return int(
-            customer_topics[user_id]
-        )
+    existing_topic = get_customer_topic(customer_id)
+
+    if existing_topic:
+        return existing_topic
 
     first_name = (
         user.get("first_name")
@@ -313,16 +335,20 @@ def create_customer_topic(user):
 
         topic_name = (
             f"👤 {first_name} "
-            f"(@{username}) - {user_id}"
+            f"(@{username}) - {customer_id}"
         )
 
     else:
 
         topic_name = (
-            f"👤 {first_name} - {user_id}"
+            f"👤 {first_name} - {customer_id}"
         )
 
     topic_name = topic_name[:128]
+
+    # --------------------------------------------------------
+    # Create Telegram forum topic
+    # --------------------------------------------------------
 
     result = tg(
         "createForumTopic",
@@ -336,20 +362,26 @@ def create_customer_topic(user):
         "result"
     ]["message_thread_id"]
 
-    customer_topics[user_id] = topic_id
+    # --------------------------------------------------------
+    # IMPORTANT:
+    # Save mapping permanently in PostgreSQL
+    # --------------------------------------------------------
 
-    save_database()
+    save_customer_topic(
+        customer_id,
+        topic_id
+    )
 
     print(
         f"Created topic {topic_id} "
-        f"for customer {user_id}"
+        f"for customer {customer_id}"
     )
 
     return topic_id
 
 
 # ============================================================
-# SEND CUSTOMER MESSAGE TO SUPPORT
+# CUSTOMER PRIVATE MESSAGE → SUPPORT GROUP
 # ============================================================
 
 def send_customer_message_to_support(
@@ -357,11 +389,9 @@ def send_customer_message_to_support(
     text
 ):
 
-    user_id = str(user["id"])
+    customer_id = int(user["id"])
 
-    topic_id = create_customer_topic(
-        user
-    )
+    topic_id = create_customer_topic(user)
 
     first_name = (
         user.get("first_name")
@@ -382,11 +412,11 @@ def send_customer_message_to_support(
 
     support_message = (
         f"👤 Customer: {customer_name}\n"
-        f"🆔 User ID: {user['id']}\n\n"
+        f"🆔 User ID: {customer_id}\n\n"
         f"{text}"
     )
 
-    result = tg(
+    tg(
         "sendMessage",
         {
             "chat_id": SUPPORT_GROUP_ID,
@@ -395,169 +425,17 @@ def send_customer_message_to_support(
         }
     )
 
-    support_message_id = result[
-        "result"
-    ]["message_id"]
-
-    # --------------------------------------------------------
-    # VERY IMPORTANT
-    # Save support message ID -> customer ID
-    # --------------------------------------------------------
-
-    support_messages[
-        str(support_message_id)
-    ] = user_id
-
-    save_database()
-
     print(
-        f"Customer {user_id} -> "
-        f"topic {topic_id} -> "
-        f"support message {support_message_id}"
+        f"Customer {customer_id} -> "
+        f"Topic {topic_id}"
     )
 
 
 # ============================================================
-# FIND CUSTOMER BY TOPIC
+# ADMIN MESSAGE → CUSTOMER
 # ============================================================
 
-def find_customer_by_topic(topic_id):
-
-    if not topic_id:
-        return None
-
-    try:
-
-        topic_id = int(topic_id)
-
-    except Exception:
-
-        return None
-
-    for user_id, saved_topic_id in customer_topics.items():
-
-        try:
-
-            if int(saved_topic_id) == topic_id:
-
-                return int(user_id)
-
-        except Exception:
-
-            continue
-
-    return None
-
-
-# ============================================================
-# FIND CUSTOMER BY SUPPORT MESSAGE
-# ============================================================
-
-def find_customer_by_support_message(
-    message_id
-):
-
-    if not message_id:
-        return None
-
-    user_id = support_messages.get(
-        str(message_id)
-    )
-
-    if not user_id:
-        return None
-
-    try:
-
-        return int(user_id)
-
-    except Exception:
-
-        return None
-
-
-# ============================================================
-# FIND CUSTOMER FROM ADMIN MESSAGE
-# ============================================================
-
-def find_customer_from_admin_message(
-    message
-):
-
-    # --------------------------------------------------------
-    # METHOD 1
-    # Topic ID
-    # --------------------------------------------------------
-
-    topic_id = message.get(
-        "message_thread_id"
-    )
-
-    customer_id = find_customer_by_topic(
-        topic_id
-    )
-
-    if customer_id:
-
-        return customer_id
-
-
-    # --------------------------------------------------------
-    # METHOD 2
-    # Reply-to message
-    # --------------------------------------------------------
-
-    replied_message = message.get(
-        "reply_to_message"
-    )
-
-    if replied_message:
-
-        replied_message_id = replied_message.get(
-            "message_id"
-        )
-
-        customer_id = (
-            find_customer_by_support_message(
-                replied_message_id
-            )
-        )
-
-        if customer_id:
-
-            return customer_id
-
-
-        # ----------------------------------------------------
-        # Sometimes Telegram puts thread ID
-        # inside replied message
-        # ----------------------------------------------------
-
-        replied_thread_id = (
-            replied_message.get(
-                "message_thread_id"
-            )
-        )
-
-        customer_id = find_customer_by_topic(
-            replied_thread_id
-        )
-
-        if customer_id:
-
-            return customer_id
-
-
-    return None
-
-
-# ============================================================
-# SEND ADMIN REPLY TO CUSTOMER
-# ============================================================
-
-def send_admin_reply_to_customer(
-    message
-):
+def send_admin_message_to_customer(message):
 
     text = (
         message.get("text")
@@ -565,57 +443,60 @@ def send_admin_reply_to_customer(
     ).strip()
 
     if not text:
+        print("Support message has no text")
+        return False
+
+    # --------------------------------------------------------
+    # IMPORTANT:
+    # Telegram sends message_thread_id for forum topics.
+    # --------------------------------------------------------
+
+    topic_id = message.get(
+        "message_thread_id"
+    )
+
+    if not topic_id:
 
         print(
-            "Admin message has no text"
+            "No message_thread_id in support message"
         )
 
         return False
 
+    try:
+        topic_id = int(topic_id)
 
-    customer_id = (
-        find_customer_from_admin_message(
-            message
+    except Exception:
+
+        print(
+            "Invalid topic ID:",
+            topic_id
         )
-    )
 
+        return False
+
+    # --------------------------------------------------------
+    # Find customer from permanent DB mapping
+    # --------------------------------------------------------
+
+    customer_id = get_customer_by_topic(
+        topic_id
+    )
 
     if not customer_id:
 
         print(
             "Could not find customer for "
-            f"support message "
-            f"{message.get('message_id')}"
+            f"topic {topic_id}"
         )
-
-        print(
-            "message_thread_id =",
-            message.get(
-                "message_thread_id"
-            )
-        )
-
-        replied = message.get(
-            "reply_to_message"
-        )
-
-        if replied:
-
-            print(
-                "reply_to_message_id =",
-                replied.get(
-                    "message_id"
-                )
-            )
 
         return False
 
-
     # --------------------------------------------------------
-    # SEND TO CUSTOMER
+    # Send admin message to customer
     # --------------------------------------------------------
 
-    result = tg(
+    tg(
         "sendMessage",
         {
             "chat_id": customer_id,
@@ -623,10 +504,10 @@ def send_admin_reply_to_customer(
         }
     )
 
-
     print(
-        f"Admin reply sent to customer "
-        f"{customer_id}"
+        f"Admin message sent to customer "
+        f"{customer_id} "
+        f"from topic {topic_id}"
     )
 
     return True
@@ -652,31 +533,27 @@ def webhook():
 
         if supplied_secret != WEBHOOK_SECRET:
 
-            print(
-                "Wrong webhook secret"
-            )
+            print("Wrong webhook secret")
 
             return "forbidden", 403
-
 
     update = request.get_json(
         silent=True
     ) or {}
 
-
     try:
 
-        message = update.get(
-            "message"
-        )
+        # ----------------------------------------------------
+        # Only normal message updates
+        # ----------------------------------------------------
 
+        message = update.get("message")
 
         if not message:
 
             return jsonify({
                 "ok": True
             })
-
 
         user = message.get(
             "from",
@@ -688,18 +565,15 @@ def webhook():
             {}
         )
 
-        chat_id = chat.get(
-            "id"
-        )
+        chat_id = chat.get("id")
 
         text = (
             message.get("text")
             or ""
         ).strip()
 
-
         # ----------------------------------------------------
-        # IGNORE BOT MESSAGES
+        # Ignore messages sent by bots
         # ----------------------------------------------------
 
         if user.get("is_bot"):
@@ -708,6 +582,11 @@ def webhook():
                 "ok": True
             })
 
+        if not chat_id:
+
+            return jsonify({
+                "ok": True
+            })
 
         # ====================================================
         # CUSTOMER PRIVATE CHAT
@@ -721,17 +600,14 @@ def webhook():
                     "ok": True
                 })
 
-
             send_customer_message_to_support(
                 user,
                 text
             )
 
-
             return jsonify({
                 "ok": True
             })
-
 
         # ====================================================
         # SECRET SUPPORT GROUP
@@ -739,23 +615,21 @@ def webhook():
 
         if int(chat_id) == SUPPORT_GROUP_ID:
 
-            # Ignore commands
+            # Ignore bot commands
             if text.startswith("/"):
 
                 return jsonify({
                     "ok": True
                 })
 
+            # ------------------------------------------------
+            # ANY HUMAN ADMIN / STAFF MESSAGE
+            # IN A CUSTOMER TOPIC WILL BE SENT TO CUSTOMER
+            # ------------------------------------------------
 
-            # Try to send admin message
-            # to the correct customer
-
-            handled = (
-                send_admin_reply_to_customer(
-                    message
-                )
+            handled = send_admin_message_to_customer(
+                message
             )
-
 
             if not handled:
 
@@ -764,11 +638,9 @@ def webhook():
                     "linked to a customer."
                 )
 
-
             return jsonify({
                 "ok": True
             })
-
 
         # ====================================================
         # FIRST LANGUAGE GROUP
@@ -786,16 +658,13 @@ def webhook():
                     "ok": True
                 })
 
-
             send_language_warning(
                 message
             )
 
-
             return jsonify({
                 "ok": True
             })
-
 
         # ====================================================
         # OTHER GROUPS
@@ -804,7 +673,6 @@ def webhook():
         return jsonify({
             "ok": True
         })
-
 
     except Exception as e:
 
