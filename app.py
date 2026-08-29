@@ -1,4 +1,5 @@
 import os
+import re
 import requests
 from flask import Flask, request, jsonify
 from langdetect import detect, DetectorFactory, LangDetectException
@@ -37,7 +38,6 @@ WARNINGS = {
     "ar": "يرجى إرسال الرسائل باللغة الإنجليزية.",
     "bg": "Моля, изпращайте съобщения на английски.",
     "bn": "দয়া করে ইংরেজিতে মেসেজ পাঠান।",
-    "el": "Παρακαλώ στείλτε μηνύματα στα αγγλικά.",
     "fa": "لطفاً پیام‌ها را به انگلیسی ارسال کنید.",
     "gu": "કૃપા કરીને સંદેશા અંગ્રેજીમાં મોકલો.",
     "he": "אנא שלח הודעות באנגלית.",
@@ -105,6 +105,9 @@ def is_admin(chat_id, user_id):
         return False
 
 
+USER_ID_IN_NOTICE = re.compile(r"User ID:\s*(\d+)")
+
+
 def forward_to_admin(user, text):
 
     if not ADMIN_CHAT_IDS:
@@ -127,6 +130,39 @@ def forward_to_admin(user, text):
             tg("sendMessage", {"chat_id": chat_id, "text": notice})
         except Exception as e:
             print(f"Failed to forward to admin {chat_id}:", repr(e))
+
+
+def try_relay_admin_reply(message):
+    """
+    If an admin replies (Telegram's Reply feature) to one of our forwarded
+    notices, pull the original sender's User ID out of that notice and
+    send the admin's text straight to them instead of re-forwarding it
+    to the other admins. Returns True if it handled (and sent) a relay.
+    """
+
+    replied = message.get("reply_to_message")
+
+    if not replied:
+        return False
+
+    original_text = replied.get("text") or ""
+    match = USER_ID_IN_NOTICE.search(original_text)
+
+    if not match:
+        return False
+
+    target_user_id = match.group(1)
+    reply_text = (message.get("text") or "").strip()
+
+    if not reply_text:
+        return False
+
+    try:
+        tg("sendMessage", {"chat_id": target_user_id, "text": reply_text})
+    except Exception as e:
+        print(f"Failed to relay admin reply to {target_user_id}:", repr(e))
+
+    return True
 
 
 def send_reply(chat_id, reply_to_message_id, text):
@@ -196,9 +232,17 @@ def webhook():
             return jsonify({"ok": True})
 
         # Someone DM'd the bot directly (private chat, not the group).
-        # Forward it to the owner so it's actually visible somewhere,
-        # since Telegram gives bot owners no inbox of their own.
         if chat.get("type") == "private":
+
+            # If this is an admin replying to one of our forwarded
+            # notices, relay it straight to the original sender instead
+            # of re-forwarding it as a fresh notice.
+            if str(chat_id) in ADMIN_CHAT_IDS and try_relay_admin_reply(message):
+                return jsonify({"ok": True})
+
+            # Otherwise, forward it to the owner(s) so it's actually
+            # visible somewhere, since Telegram gives bot owners no
+            # inbox of their own.
             forward_to_admin(user, text)
             return jsonify({"ok": True})
 
