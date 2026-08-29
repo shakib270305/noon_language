@@ -12,6 +12,16 @@ app = Flask(__name__)
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 
+# Your own Telegram numeric user ID(s), comma-separated (get each from
+# @userinfobot). Any private message someone sends directly to the bot
+# gets forwarded to every ID listed here, since Telegram has no built-in
+# inbox/dashboard for bot owners.
+ADMIN_CHAT_IDS = [
+    cid.strip()
+    for cid in os.environ.get("ADMIN_CHAT_IDS", "").split(",")
+    if cid.strip()
+]
+
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # ---------------------------------------------------------------------------
@@ -23,7 +33,7 @@ TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # "Please send messages in English." pre-translated for every language code
 # that langdetect can return. Keys match langdetect's ISO codes exactly.
-WARNINGS = {    
+WARNINGS = {
     "ar": "يرجى إرسال الرسائل باللغة الإنجليزية.",
     "bg": "Моля, изпращайте съобщения на английски.",
     "bn": "দয়া করে ইংরেজিতে মেসেজ পাঠান।",
@@ -34,11 +44,11 @@ WARNINGS = {
     "hi": "कृपया संदेश अंग्रेज़ी में भेजें।",
     "ja": "英語でメッセージを送ってください。",
     "kn": "ದಯವಿಟ್ಟು ಸಂದೇಶಗಳನ್ನು ಇಂಗ್ಲಿಷ್‌ನಲ್ಲಿ ಕಳುಹಿಸಿ.",
-    "ko": "영어로 메시지를 보내주세요.",
+    "ko": "영어로 메시지를 보내주세요.",,
     "mk": "Ве молиме испраќајте пораки на англиски.",
     "ml": "ദയവായി സന്ദേശങ്ങൾ ഇംഗ്ലീഷിൽ അയയ്ക്കുക.",
     "mr": "कृपया संदेश इंग्रजीत पाठवा.",
-    "ne": "कृपया सन्देशहरू अङ्ग्रेजीमा पठाउनुहोस्।",
+    "ne": "कृपया सन्देशहरू अङ्ग्रेजीमा पठाउनुहोस्।",,
     "pa": "ਕਿਰਪਾ ਕਰਕੇ ਸੁਨੇਹੇ ਅੰਗਰੇਜ਼ੀ ਵਿੱਚ ਭੇਜੋ।",
     "ru": "Пожалуйста, отправляйте сообщения на английском.",
     "ta": "தயவுசெய்து செய்திகளை ஆங்கிலத்தில் அனுப்பவும்.",
@@ -46,8 +56,8 @@ WARNINGS = {
     "th": "กรุณาส่งข้อความเป็นภาษาอังกฤษ",
     "uk": "Будь ласка, надсилайте повідомлення англійською.",
     "ur": "براہ کرم پیغامات انگریزی میں بھیجیں۔",
- "zh-cn": "请用英语发送消息。",
- "zh-tw": "請用英文發送訊息。",
+    "zh-cn": "请用英语发送消息。",
+    "zh-tw": "請用英文發送訊息。",
 }
 
 
@@ -93,6 +103,30 @@ def is_admin(chat_id, user_id):
 
     except Exception:
         return False
+
+
+def forward_to_admin(user, text):
+
+    if not ADMIN_CHAT_IDS:
+        return
+
+    name = (user.get("first_name") or "").strip()
+    username = user.get("username")
+    tag = f"@{username}" if username else "(no username)"
+    user_id = user.get("id")
+
+    notice = (
+        f"📩 New private message to the bot\n"
+        f"From: {name} {tag}\n"
+        f"User ID: {user_id}\n\n"
+        f"{text}"
+    )
+
+    for chat_id in ADMIN_CHAT_IDS:
+        try:
+            tg("sendMessage", {"chat_id": chat_id, "text": notice})
+        except Exception as e:
+            print(f"Failed to forward to admin {chat_id}:", repr(e))
 
 
 def send_reply(chat_id, reply_to_message_id, text):
@@ -156,8 +190,20 @@ def webhook():
         if not chat_id or not user_id:
             return jsonify({"ok": True})
 
-        # Ignore bots and commands
-        if user.get("is_bot") or text.startswith("/"):
+        # Ignore other bots (but not commands here — /start in a private
+        # chat still needs to reach the forwarding block below)
+        if user.get("is_bot"):
+            return jsonify({"ok": True})
+
+        # Someone DM'd the bot directly (private chat, not the group).
+        # Forward it to the owner so it's actually visible somewhere,
+        # since Telegram gives bot owners no inbox of their own.
+        if chat.get("type") == "private":
+            forward_to_admin(user, text)
+            return jsonify({"ok": True})
+
+        # Ignore commands (group only, from here on)
+        if text.startswith("/"):
             return jsonify({"ok": True})
 
         # Ignore group admins
