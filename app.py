@@ -58,13 +58,103 @@ def init_database():
             CREATE TABLE IF NOT EXISTS customer_topics (
                 customer_id BIGINT PRIMARY KEY,
                 topic_id BIGINT UNIQUE NOT NULL,
+                display_number INTEGER,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
+        """)
+
+        cur.execute("""
+            CREATE SEQUENCE IF NOT EXISTS
+                customer_display_seq START 1
+        """)
+
+        cur.execute("""
+            ALTER TABLE customer_topics
+            ADD COLUMN IF NOT EXISTS display_number INTEGER
         """)
 
         conn.commit()
 
         cur.close()
+
+    finally:
+
+        conn.close()
+
+
+def get_or_create_display_number(customer_id):
+    """
+    Returns a small, anonymous, sequential number to represent this
+    customer everywhere agents can see it (topic names, headers) —
+    never their real name, username, or Telegram user id.
+    """
+
+    conn = db_connect()
+
+    try:
+
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT display_number
+            FROM customer_topics
+            WHERE customer_id = %s
+            """,
+            (customer_id,)
+        )
+
+        row = cur.fetchone()
+
+        if row and row[0] is not None:
+
+            cur.close()
+
+            return int(row[0])
+
+        cur.execute(
+            "SELECT nextval('customer_display_seq')"
+        )
+
+        display_number = int(
+            cur.fetchone()[0]
+        )
+
+        cur.close()
+
+        return display_number
+
+    finally:
+
+        conn.close()
+
+
+def get_customer_id_by_display_number(display_number):
+
+    conn = db_connect()
+
+    try:
+
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT customer_id
+            FROM customer_topics
+            WHERE display_number = %s
+            """,
+            (display_number,)
+        )
+
+        row = cur.fetchone()
+
+        cur.close()
+
+        if row:
+
+            return int(row[0])
+
+        return None
 
     finally:
 
@@ -137,7 +227,8 @@ def get_customer_by_topic(topic_id):
 
 def save_customer_topic(
     customer_id,
-    topic_id
+    topic_id,
+    display_number
 ):
 
     conn = db_connect()
@@ -149,16 +240,21 @@ def save_customer_topic(
         cur.execute(
             """
             INSERT INTO customer_topics
-                (customer_id, topic_id)
+                (customer_id, topic_id, display_number)
             VALUES
-                (%s, %s)
+                (%s, %s, %s)
             ON CONFLICT (customer_id)
             DO UPDATE SET
-                topic_id = EXCLUDED.topic_id
+                topic_id = EXCLUDED.topic_id,
+                display_number = COALESCE(
+                    customer_topics.display_number,
+                    EXCLUDED.display_number
+                )
             """,
             (
                 customer_id,
-                topic_id
+                topic_id,
+                display_number
             )
         )
 
@@ -321,33 +417,24 @@ def create_customer_topic(user):
             f"found for customer {customer_id}"
         )
 
-        return existing_topic
-
-    # --------------------------------------------------------
-    # Create new topic
-    # --------------------------------------------------------
-
-    first_name = (
-        user.get("first_name")
-        or "Customer"
-    )
-
-    username = user.get(
-        "username"
-    )
-
-    if username:
-
-        topic_name = (
-            f"👤 {first_name} "
-            f"(@{username}) - {customer_id}"
+        display_number = get_or_create_display_number(
+            customer_id
         )
 
-    else:
+        return existing_topic, display_number
 
-        topic_name = (
-            f"👤 {first_name} - {customer_id}"
-        )
+    # --------------------------------------------------------
+    # Create new topic — deliberately anonymous. Agents in the
+    # support group must not be able to identify the customer,
+    # so the topic name/header only ever shows a sequential
+    # number, never their name, username, or Telegram user id.
+    # --------------------------------------------------------
+
+    display_number = get_or_create_display_number(
+        customer_id
+    )
+
+    topic_name = f"👤 Customer #{display_number}"
 
     topic_name = topic_name[:128]
 
@@ -369,20 +456,21 @@ def create_customer_topic(user):
 
     save_customer_topic(
         customer_id,
-        topic_id
+        topic_id,
+        display_number
     )
 
     print(
         f"Created topic {topic_id} "
-        f"for customer {customer_id}"
+        f"for customer #{display_number}"
     )
 
     print(
         f"Saved mapping: "
-        f"{customer_id} -> {topic_id}"
+        f"customer #{display_number} -> topic {topic_id}"
     )
 
-    return topic_id
+    return topic_id, display_number
 
 
 # ============================================================
@@ -418,41 +506,22 @@ def send_customer_message_to_support(
         user["id"]
     )
 
-    topic_id = create_customer_topic(
+    topic_id, display_number = create_customer_topic(
         user
     )
 
-    first_name = (
-        user.get("first_name")
-        or "Customer"
-    )
+    # A short, ANONYMOUS header is posted first — just the sequential
+    # display number, never the customer's real name, username, or
+    # Telegram user id. This keeps the "Customer #<number>" fallback-
+    # recovery pattern usable in extract_customer_id_from_message even
+    # if the database mapping is ever lost, without exposing identity
+    # to agents. The actual message — text, photo, sticker, video,
+    # voice, GIF, whatever it is — is then copied in as-is right after
+    # it using copyMessage, which handles every content type without
+    # needing separate code per media type, and never carries Telegram's
+    # "forwarded from" tag either.
 
-    username = user.get(
-        "username"
-    )
-
-    if username:
-
-        customer_name = (
-            f"{first_name} (@{username})"
-        )
-
-    else:
-
-        customer_name = first_name
-
-    # A short header identifying the sender is posted first (kept as
-    # plain text so the "User ID: <number>" fallback-recovery logic in
-    # extract_customer_id_from_message still works even if the database
-    # mapping is ever lost). The actual message — text, photo, sticker,
-    # video, voice, GIF, whatever it is — is then copied in as-is right
-    # after it using copyMessage, which handles every content type
-    # without needing separate code per media type.
-
-    header = (
-        f"👤 Customer: {customer_name}\n"
-        f"🆔 User ID: {customer_id}"
-    )
+    header = f"🆔 Customer #{display_number}"
 
     tg(
         "sendMessage",
@@ -511,8 +580,10 @@ def extract_customer_id_from_message(
 
         return None
 
+    # Matches the anonymous "🆔 Customer #<number>" header — never a
+    # raw Telegram user id, so agents can't read one out of the chat.
     match = re.search(
-        r"(?:User ID|USER ID|user id)\s*:\s*(\d+)",
+        r"Customer\s*#\s*(\d+)",
         text
     )
 
@@ -520,13 +591,17 @@ def extract_customer_id_from_message(
 
         try:
 
-            return int(
+            display_number = int(
                 match.group(1)
             )
 
         except Exception:
 
             return None
+
+        return get_customer_id_by_display_number(
+            display_number
+        )
 
     return None
 
@@ -634,7 +709,10 @@ def send_admin_message_to_customer(
 
                     save_customer_topic(
                         customer_id,
-                        topic_id
+                        topic_id,
+                        get_or_create_display_number(
+                            customer_id
+                        )
                     )
 
                     print(
@@ -688,7 +766,10 @@ def send_admin_message_to_customer(
 
                         save_customer_topic(
                             customer_id,
-                            topic_id
+                            topic_id,
+                            get_or_create_display_number(
+                                customer_id
+                            )
                         )
 
                     except Exception as e:
